@@ -1,0 +1,88 @@
+# Checks that a pull request is linked to an issue.
+# Uses pull_request_target so the job can comment on pull requests from forks
+# and runs without waiting for approval on a first contribution. It never
+# checks out or runs code from the pull request.
+name: PR Linked Issue
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-linked-issue-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-linked-issue:
+    if: github.event.pull_request.state == 'open' && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Check for a linked issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const marker = '<!-- pr-linked-issue -->';
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+
+            const { repository } = await github.graphql(
+              `query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 10) {
+                      nodes { number }
+                    }
+                  }
+                }
+              }`,
+              { owner, repo, number }
+            );
+            const linked = repository.pullRequest.closingIssuesReferences.nodes;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: number,
+              per_page: 100,
+            });
+            const previous = comments.find(
+              (c) => c.user?.login === 'github-actions[bot]' && c.body?.includes(marker)
+            );
+
+            const post = async (body) => {
+              if (!previous) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+              } else if (previous.body !== body) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+              }
+            };
+
+            if (linked.length > 0) {
+              core.info(`Linked issue(s): ${linked.map((i) => `#${i.number}`).join(', ')}`);
+              if (previous) {
+                await post(`${marker}\nThis pull request is now linked to an issue. Thanks!`);
+              }
+              return;
+            }
+
+            await post(
+              [
+                marker,
+                'This pull request is not linked to an issue.',
+                '',
+                'Please add a closing keyword followed by the issue number to the description, for example:',
+                '',
+                '```',
+                'Fixes #123',
+                '```',
+                '',
+                'If there is no issue for this change yet, please open one first.',
+              ].join('\n')
+            );
+            core.setFailed('This pull request is not linked to an issue.');
