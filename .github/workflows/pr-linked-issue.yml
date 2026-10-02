@@ -10,7 +10,6 @@ on:
 
 permissions:
   pull-requests: write
-  issues: read
 
 concurrency:
   group: pr-linked-issue-${{ github.event.pull_request.number }}
