@@ -1,0 +1,133 @@
+const MISSING_ISSUE_MARKER = '<!-- Missing Linked Issue -->';
+
+async function getLinkedOpenIssues(github, owner, repo, prNumber) {
+  const query = `
+    query($owner: String!, $repo: String!, $prNumber: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $prNumber) {
+          closingIssuesReferences(first: 100) {
+            nodes {
+              number
+              state
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const result = await github.graphql(query, { owner, repo, prNumber });
+    const issues = result.repository.pullRequest.closingIssuesReferences.nodes || [];
+    return issues.filter(issue => issue.state === 'OPEN');
+  } catch (error) {
+    console.error(`Failed to fetch linked issues for PR #${prNumber}:`, error.message);
+    return null;
+  }
+}
+
+module.exports = async ({ github, context, core }) => {
+  let prNumber;
+  try {
+    const isDryRun = process.env.DRY_RUN === 'true';
+    prNumber = Number(process.env.PR_NUMBER) || context.payload.pull_request?.number;
+
+    if (!prNumber) {
+      throw new Error('PR number could not be determined');
+    }
+
+    console.log(`Processing PR #${prNumber} (Dry run: ${isDryRun})`);
+
+    // For workflow_dispatch, we need to fetch PR details
+    let prData;
+    if (context.payload.pull_request) {
+      prData = context.payload.pull_request;
+    } else {
+      // workflow_dispatch case - fetch PR data
+      const prResponse = await github.rest.pulls.get({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        pull_number: prNumber,
+      });
+      prData = prResponse.data;
+    }
+
+    const authorType = prData.user?.type;
+    const authorLogin = prData.user?.login;
+
+    if (authorType === "Bot" || authorLogin?.endsWith('[bot]')) {
+      console.log(`Skipping comment: PR created by bot (${authorLogin})`);
+      return;
+    }
+
+    const comments = await github.rest.issues.listComments({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      issue_number: prNumber,
+    });
+
+    const alreadyCommentedMissingIssue = comments.data.some(comment =>
+      comment.body?.includes(MISSING_ISSUE_MARKER)
+    );
+
+    const linkedIssues = await getLinkedOpenIssues(github, context.repo.owner, context.repo.repo, prNumber);
+    if (linkedIssues === null) {
+      console.log('Could not determine linked issues. Skipping comment for safety.');
+      return;
+    }
+
+    if (linkedIssues.length === 0) {
+      if (alreadyCommentedMissingIssue) {
+        console.log('Missing-issue reminder already posted on this PR');
+        return;
+      }
+
+      const safeAuthor = authorLogin ?? 'there';
+      const commentBody = [`${MISSING_ISSUE_MARKER}` +
+        `Hi @${safeAuthor} 👋`,
+        ``,
+        `Linking pull requests to issues helps us significantly with reviewing pull requests and keeping the repository healthy.`,
+        ``,
+        `🚨 **This pull request does not have an issue linked.**`,
+        `If this PR remains unlinked, it will be automatically closed.`,
+        ``,
+        `Please link an issue using the following format:`,
+        '```',
+        'Fixes #123',
+        '```',
+        ``,
+        `If no issue exists yet, please create one first.`,
+        ``,
+        `Thanks!`
+      ].join('\n');
+
+      // On pull_request, PRs from forks only get a read-only token, so the bot can't comment on them.
+      const isForkPR = context.eventName === 'pull_request' &&
+        prData.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+
+      if (isDryRun) {
+        console.log('DRY RUN: Would post the following comment:');
+        console.log('---');
+        console.log(commentBody);
+        console.log('---');
+      } else if (isForkPR) {
+        core.warning('This pull request does not have an issue linked. Please link an issue by adding "Fixes #123" to the description. If this PR remains unlinked, it will be automatically closed.');
+      } else {
+        await github.rest.issues.createComment({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          issue_number: prNumber,
+          body: commentBody,
+        });
+        console.log('Missing-issue reminder posted successfully');
+      }
+    } else {
+      console.log('PR has linked issue - no comment needed');
+    }
+  } catch (error) {
+    console.error('Error processing PR:', error);
+    console.error('PR number:', prNumber);
+    console.error('Repository:', `${context.repo.owner}/${context.repo.repo}`);
+    throw error;
+  }
+};
